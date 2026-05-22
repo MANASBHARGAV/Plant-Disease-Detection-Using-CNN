@@ -1,171 +1,209 @@
 
+# -----------------------------
+# Imports
+# -----------------------------
+import os
 import numpy as np
-import pickle
-import cv2
-from os import listdir
-from sklearn.preprocessing import LabelBinarizer
-from keras.models import Sequential
-from keras.layers.normalization import BatchNormalization
-from keras.layers.convolutional import Conv2D
-from keras.layers.convolutional import MaxPooling2D
-from keras.layers.core import Activation, Flatten, Dropout, Dense
-from keras import backend as K
-from keras.preprocessing.image import ImageDataGenerator
-from keras.optimizers import Adam
-from keras.preprocessing import image
-from keras.preprocessing.image import img_to_array
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-import tensorflow
+from PIL import Image
+import pickle
 
-EPOCHS = 25
-INIT_LR = 1e-3
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.model_selection import train_test_split
+
+# -----------------------------
+# Parameters
+# -----------------------------
+EPOCHS = 10  # Reduce for Colab demo
 BS = 32
-default_image_size = tuple((256, 256))
-image_size = 0
-directory_root = '../input/plantvillage/'
-width=256
-height=256
-depth=3
+IMAGE_SIZE = (256, 256)
+DIRECTORY_ROOT = '../input/plantvillage/'  # Change if needed
 
-def convert_image_to_array(image_dir):
-    try:
-        image = cv2.imread(image_dir)
-        if image is not None :
-            image = cv2.resize(image, default_image_size)   
-            return img_to_array(image)
-        else :
-            return np.array([])
-    except Exception as e:
-        print(f"Error : {e}")
-        return None
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {device}")
 
-image_list, label_list = [], []
-try:
-    print("[INFO] Loading images ...")
-    root_dir = listdir(directory_root)
-    for directory in root_dir :
-        # remove .DS_Store from list
-        if directory == ".DS_Store" :
-            root_dir.remove(directory)
+# -----------------------------
+# Dataset Class
+# -----------------------------
+class PlantDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
 
-    for plant_folder in root_dir :
-        plant_disease_folder_list = listdir(f"{directory_root}/{plant_folder}")
-        
-        for disease_folder in plant_disease_folder_list :
-            # remove .DS_Store from list
-            if disease_folder == ".DS_Store" :
-                plant_disease_folder_list.remove(disease_folder)
+    def __len__(self):
+        return len(self.image_paths)
 
-        for plant_disease_folder in plant_disease_folder_list:
-            print(f"[INFO] Processing {plant_disease_folder} ...")
-            plant_disease_image_list = listdir(f"{directory_root}/{plant_folder}/{plant_disease_folder}/")
-                
-            for single_plant_disease_image in plant_disease_image_list :
-                if single_plant_disease_image == ".DS_Store" :
-                    plant_disease_image_list.remove(single_plant_disease_image)
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        label = self.labels[idx]
 
-            for image in plant_disease_image_list[:200]:
-                image_directory = f"{directory_root}/{plant_folder}/{plant_disease_folder}/{image}"
-                if image_directory.endswith(".jpg") == True or image_directory.endswith(".JPG") == True:
-                    image_list.append(convert_image_to_array(image_directory))
-                    label_list.append(plant_disease_folder)
-    print("[INFO] Image loading completed")  
-except Exception as e:
-    print(f"Error : {e}")
+        if self.transform:
+            image = self.transform(image)
 
-image_size = len(image_list)
+        return image, torch.tensor(label, dtype=torch.long)
 
+# -----------------------------
+# Load images and labels
+# -----------------------------
+image_paths, labels = [], []
+
+print("[INFO] Loading images ...")
+for plant_folder in os.listdir(DIRECTORY_ROOT):
+    if plant_folder == ".DS_Store": continue
+    plant_path = os.path.join(DIRECTORY_ROOT, plant_folder)
+    
+    for disease_folder in os.listdir(plant_path):
+        if disease_folder == ".DS_Store": continue
+        disease_path = os.path.join(plant_path, disease_folder)
+        for img_file in os.listdir(disease_path)[:200]:  # limit for speed
+            if img_file.lower().endswith(".jpg"):
+                image_paths.append(os.path.join(disease_path, img_file))
+                labels.append(disease_folder)
+
+print(f"[INFO] Total images loaded: {len(image_paths)}")
+
+# Encode labels
 label_binarizer = LabelBinarizer()
-image_labels = label_binarizer.fit_transform(label_list)
-pickle.dump(label_binarizer,open('label_transform.pkl', 'wb'))
-n_classes = len(label_binarizer.classes_)
+labels_encoded = label_binarizer.fit_transform(labels)
+pickle.dump(label_binarizer, open("label_transform.pkl", "wb"))
+n_classes = labels_encoded.shape[1]
+labels_class = np.argmax(labels_encoded, axis=1)  # integer labels
 
-print(label_binarizer.classes_)
+# -----------------------------
+# Train/Test Split
+# -----------------------------
+x_train, x_test, y_train, y_test = train_test_split(
+    image_paths, labels_class, test_size=0.2, random_state=42
+)
 
-np_image_list = np.array(image_list, dtype=np.float16) / 225.0
+# -----------------------------
+# Data augmentation & transforms
+# -----------------------------
+train_transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.RandomRotation(25),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomResizedCrop(IMAGE_SIZE[0], scale=(0.8, 1.0)),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+])
 
-print("[INFO] Spliting data to train, test")
-x_train, x_test, y_train, y_test = train_test_split(np_image_list, image_labels, test_size=0.2, random_state = 42)
+test_transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor(),
+])
 
-aug = ImageDataGenerator(
-    rotation_range=25, width_shift_range=0.1,
-    height_shift_range=0.1, shear_range=0.2, 
-    zoom_range=0.2,horizontal_flip=True, 
-    fill_mode="nearest")
+train_dataset = PlantDataset(x_train, y_train, transform=train_transform)
+test_dataset = PlantDataset(x_test, y_test, transform=test_transform)
 
-model = Sequential()
-inputShape = (height, width, depth)
-chanDim = -1
-if K.image_data_format() == "channels_first":
-    inputShape = (depth, height, width)
-    chanDim = 1
-model.add(Conv2D(32, (3, 3), padding="same",input_shape=inputShape))
-model.add(Activation("relu"))
-model.add(BatchNormalization(axis=chanDim))
-model.add(MaxPooling2D(pool_size=(3, 3)))
-model.add(Dropout(0.25))
-model.add(Conv2D(64, (3, 3), padding="same"))
-model.add(Activation("relu"))
-model.add(BatchNormalization(axis=chanDim))
-model.add(Conv2D(64, (3, 3), padding="same"))
-model.add(Activation("relu"))
-model.add(BatchNormalization(axis=chanDim))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
-model.add(Conv2D(128, (3, 3), padding="same"))
-model.add(Activation("relu"))
-model.add(BatchNormalization(axis=chanDim))
-model.add(Conv2D(128, (3, 3), padding="same"))
-model.add(Activation("relu"))
-model.add(BatchNormalization(axis=chanDim))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
-model.add(Flatten())
-model.add(Dense(1024))
-model.add(Activation("relu"))
-model.add(BatchNormalization())
-model.add(Dropout(0.5))
-model.add(Dense(n_classes))
-model.add(Activation("softmax"))
+train_loader = DataLoader(train_dataset, batch_size=BS, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BS, shuffle=False)
 
-opt = Adam(lr=INIT_LR, decay=INIT_LR / EPOCHS)
-# distribution
-model.compile(loss="binary_crossentropy", optimizer=opt,metrics=["accuracy"])
-# train the network
-print("[INFO] training network...")
+# -----------------------------
+# CNN Model
+# -----------------------------
+class CNNModel(nn.Module):
+    def __init__(self, num_classes):
+        super(CNNModel, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(32),
+            nn.MaxPool2d(3), nn.Dropout(0.25),
+            
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(64),
+            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(64),
+            nn.MaxPool2d(2), nn.Dropout(0.25),
 
-history = model.fit_generator(
-    aug.flow(x_train, y_train, batch_size=BS),
-    validation_data=(x_test, y_test),
-    steps_per_epoch=len(x_train) // BS,
-    epochs=EPOCHS, verbose=1
-    )
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(128),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(128),
+            nn.MaxPool2d(2), nn.Dropout(0.25)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128*21*21, 1024),
+            nn.ReLU(), nn.BatchNorm1d(1024), nn.Dropout(0.5),
+            nn.Linear(1024, num_classes)
+        )
 
-acc = history.history['acc']
-val_acc = history.history['val_acc']
-loss = history.history['loss']
-val_loss = history.history['val_loss']
-epochs = range(1, len(acc) + 1)
-#Train and validation accuracy
-plt.plot(epochs, acc, 'b', label='Training accurarcy')
-plt.plot(epochs, val_acc, 'r', label='Validation accurarcy')
-plt.title('Training and Validation accurarcy')
-plt.legend()
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
 
+model = CNNModel(n_classes).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# -----------------------------
+# Training
+# -----------------------------
+train_losses, test_losses = [], []
+train_acc, test_acc = [], []
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for images, targets in train_loader:
+        images, targets = images.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, predicted = torch.max(outputs, 1)
+        correct += (predicted == targets).sum().item()
+        total += targets.size(0)
+
+    train_losses.append(running_loss / len(train_dataset))
+    train_acc.append(correct / total)
+
+    model.eval()
+    val_loss, correct, total = 0.0, 0, 0
+    with torch.no_grad():
+        for images, targets in test_loader:
+            images, targets = images.to(device), targets.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == targets).sum().item()
+            total += targets.size(0)
+
+    test_losses.append(val_loss / len(test_dataset))
+    test_acc.append(correct / total)
+
+    print(f"Epoch [{epoch+1}/{EPOCHS}] "
+          f"Train Loss: {train_losses[-1]:.4f}, Train Acc: {train_acc[-1]*100:.2f}% "
+          f"Val Loss: {test_losses[-1]:.4f}, Val Acc: {test_acc[-1]*100:.2f}%")
+
+# -----------------------------
+# Plot results
+# -----------------------------
 plt.figure()
-#Train and validation loss
-plt.plot(epochs, loss, 'b', label='Training loss')
-plt.plot(epochs, val_loss, 'r', label='Validation loss')
-plt.title('Training and Validation loss')
+plt.plot(range(1, EPOCHS+1), train_acc, 'b', label='Training Accuracy')
+plt.plot(range(1, EPOCHS+1), test_acc, 'r', label='Validation Accuracy')
+plt.title('Training and Validation Accuracy')
 plt.legend()
 plt.show()
 
-print("[INFO] Calculating model accuracy")
-scores = model.evaluate(x_test, y_test)
-print(f"Test Accuracy: {scores[1]*100}")
+plt.figure()
+plt.plot(range(1, EPOCHS+1), train_losses, 'b', label='Training Loss')
+plt.plot(range(1, EPOCHS+1), test_losses, 'r', label='Validation Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.show()
 
-# save the model to disk
-print("[INFO] Saving model...")
-pickle.dump(model,open('cnn_model.pkl', 'wb'))
+# -----------------------------
+# Save model
+# -----------------------------
+torch.save(model.state_dict(), "cnn_model.pth")
+print("[INFO] Model saved as cnn_model.pth")
